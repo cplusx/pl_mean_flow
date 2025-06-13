@@ -7,7 +7,6 @@ class MeanFlowTrainer(pl.LightningModule):
     def __init__(
         self,
         pipe, 
-        cond_dropout: float=0.1,
         guidance_scale: float=2.0,
         optim_args: dict={},
         loss_weights: dict={
@@ -19,19 +18,18 @@ class MeanFlowTrainer(pl.LightningModule):
         use_ema: bool=False,
         ema_decay: float=0.99,
         ema_start: int=100,
+        t_r_equal_rate: float=0.25, # according to paper, 75% t != r
         **kwargs
     ):
         super().__init__(**kwargs)
         self.pipe = pipe
-        self.vae: AutoencoderKL = pipe.vae
-        self.denoiser: DiTTransformer2DModelREPA = pipe.denoiser
-        self.cond_encoder: nn.Module = pipe.cond_encoder
-        self.cond_dropout = cond_dropout
+        self.denoiser = pipe.denoiser
         self.guidance_scale = guidance_scale
         self.optim_args = optim_args
         self.loss_weights = loss_weights
         self.use_8bit_adam = use_8bit_adam
         self.accumulate_grad_batches = accumulate_grad_batches
+        self.t_r_equal_rate = t_r_equal_rate
         if self.accumulate_grad_batches > 1:
             self.automatic_optimization = False
         if use_ema:
@@ -58,42 +56,37 @@ class MeanFlowTrainer(pl.LightningModule):
             ignore=['ema_denoiser', 'denoiser', 'pipe']
         )
 
+    def sample_t_and_r(self, batch_size):
+        lognormal_sampler = torch.distributions.log_normal.LogNormal(loc=torch.tensor([-2.0]), scale=torch.tensor([2.0]))
+        t = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device)
+        r = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device)
+        r = torch.where(
+            torch.rand(batch_size, device=self.denoiser.device) < self.t_r_equal_rate,  # with probability t_r_equal_rate
+            t,  # if r is less than t_r_equal_rate, set r = t
+            r  # otherwise keep r as is
+        )
+        return t, r        
+
     def train_internal_step(self, batch, batch_idx, mode='train'):
-        image = batch['image'] # should be in [0, 1], (B, C, H, W)
-        edge = batch['edge']
-        image = image.to(self.vae.dtype)
-        edge = edge.to(self.vae.dtype)
-        image_cond = self.encode_condition_image(image)
-        edge_latent = self.encode_image_to_latent(edge)
+        image = batch['image']
+        image = image.to(self.denoiser.dtype)
 
-        image_cond = image_cond.to(self.denoiser.dtype)
-        edge_latent = edge_latent.to(self.denoiser.dtype)
-        timesteps = self.get_timesteps(len(image), self.num_timesteps).to(edge_latent.device, edge_latent.dtype)
-        noisy_latent, target = self.add_noise_and_get_target(edge_latent, timesteps)
+        t, r = self.sample_t_and_r(image.shape[0])
 
-        if torch.rand(1).item() < self.cond_dropout:
-            image_cond = torch.zeros_like(image_cond)
+        noise = torch.randn_like(x, device=self.denoiser.device)
+        z = (1 - t) * x + t * noise
+        v = noise - x
 
-        model_input = torch.cat([noisy_latent, image_cond], dim=1)
-        model_pred, zs = self.denoiser(model_input, timesteps, return_dict=False)
+        u, du_dt = torch.func.jvp(self.denoiser, (z, r, t), (v, 0, 1))
 
-        edge_latent_pred = self.get_x0_from_xt(noisy_latent, timesteps, model_pred)
-        edge_pred = self.decode_latent_to_image(edge_latent_pred)
+        target = (v - (t - r) * du_dt).detach()
 
         loss = 0
         res_dict = {
             'image': image,
-            'edge': edge,
-            'edge_pred': edge_pred,
         }
-        if 'l1' in self.loss_weights:
-            l1_loss = self.l1_loss(model_pred, target) * self.loss_weights['l1']
-            loss += l1_loss
-            self.log(f'{mode}/l1_loss', l1_loss, sync_dist=True)
-            res_dict['l1_loss'] = l1_loss.item()
-
         if 'l2' in self.loss_weights:
-            l2_loss = self.l2_loss(model_pred, target) * self.loss_weights['l2']
+            l2_loss = self.loss_weights['l2'] * F.mse_loss(u, target, reduction='mean')
             loss += l2_loss
             self.log(f'{mode}/l2_loss', l2_loss, sync_dist=True)
             res_dict['l2_loss'] = l2_loss.item()
