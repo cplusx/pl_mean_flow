@@ -1,0 +1,111 @@
+expt_dir: experiments
+num_colors: 6
+num_out_channels: 7
+image_size: 256
+test_image_size: ${image_size}
+expt_name: edge_discrete_diffusion_${num_colors}
+trainer_args:
+  max_epochs: 300
+  accelerator: "gpu"
+  devices: [0,1]
+  limit_train_batches: 3200
+  limit_val_batches: 1
+  check_val_every_n_epoch: 1
+  log_every_n_steps: 5
+  precision: 32
+  strategy: "deepspeed_stage_2"
+diffusion_trainer:
+  target: pl_trainer.discrete_diffusion_trainer.DiscreteDiffusionEdgeTrainer
+  params:
+    accumulate_grad_batches: 1 #2
+    loss_weights: 
+      focal_xentropy: 1.0
+    optim_args: 
+      lr: 5e-5
+      weight_decay: 1e-5
+    use_8bit_adam: False
+    gradient_checkpointing: True
+    use_ema: True
+    ema_decay: 0.99
+    ema_start: 50000
+    cond_drop_rate: 0.1
+    guidance_scale: 4.0
+pipe:
+  target: pipelines.diffusion_pipeline.DiscreteDiffusionEdgePipeline
+  params: {}
+denoiser: 
+  target: models.UNet_with_embedder.UNetWithEmbedder
+  params:
+    in_channels: 32
+    out_channels: ${num_out_channels}
+    down_block_types:
+      - DownBlock2D
+      - DownBlock2D
+      - DownBlock2D
+      - DownBlock2D
+      - DownBlock2D
+      - AttnDownBlock2D
+    up_block_types:
+      - AttnUpBlock2D
+      - UpBlock2D
+      - UpBlock2D
+      - UpBlock2D
+      - UpBlock2D
+      - UpBlock2D
+    block_out_channels:
+      - 64
+      - 128
+      - 256
+      - 512
+      - 512
+      - 1024
+    layers_per_block: 2
+data:
+  batch_size: 8 #16
+  val_batch_size: 8
+  train_shuffle: true
+  val_shuffle: true
+  collate_fn: 
+    target: diffusion_datasets.dataset_utils.image_edge_unet_collate_fn
+  train:
+    target: diffusion_datasets.dataset_utils.JointDataset
+    params:
+      mode: "train"
+      sampling_rates:
+        - 1.
+      subdatasets:
+        - target: diffusion_datasets.edge_datasets.LAION_synthetic.LAIONSyntheticQuantizedLabeledDataset
+          params: 
+            root_dir: /home/devdata/laion/edge_detection
+            image_shape: 
+              - ${image_size}
+              - ${image_size}
+            mode: train
+            num_colors: ${num_colors}
+  val:
+    target: diffusion_datasets.dataset_utils.ConcatDataset
+    params:
+      mode: "val"
+      subdatasets:
+        - target: diffusion_datasets.edge_datasets.LAION_synthetic.LAIONSyntheticQuantizedLabeledDataset
+          params: 
+            root_dir: /home/devdata/laion/edge_detection
+            image_shape: 
+              - ${image_size}
+              - ${image_size}
+            num_colors: ${num_colors}
+            mode: test
+            max_samples: 100
+callbacks:
+  - target: pytorch_lightning.callbacks.ModelCheckpoint
+    params:
+      dirpath: "${expt_dir}/${expt_name}"
+      filename: "{epoch:04d}"
+      monitor: epoch
+      mode: max
+      save_top_k: 2
+      save_last: true
+  - target: callbacks.training_visualizer.DiffusionTrainingLogger
+    params:
+      max_num_images: 8
+    require_wandb: true
