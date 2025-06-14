@@ -137,7 +137,7 @@ class MeanFlowTrainer(pl.LightningModule):
             height=height,
             width=width,
             num_samples=image.shape[0],
-            # class_labels=batch.get('class_labels', None),
+            class_labels=batch.get('label', None),
             output_type='numpy',
             return_dict=False
         )[0]

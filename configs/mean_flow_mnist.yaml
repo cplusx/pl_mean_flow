@@ -1,11 +1,9 @@
 expt_dir: experiments
 num_colors: 6
 num_out_channels: 7
-image_size: 256
-test_image_size: ${image_size}
-expt_name: edge_discrete_diffusion_${num_colors}
+expt_name: mean_flow_mnist
 trainer_args:
-  max_epochs: 300
+  max_epochs: 100
   accelerator: "gpu"
   devices: [0,1]
   limit_train_batches: 3200
@@ -15,7 +13,7 @@ trainer_args:
   precision: 32
   strategy: "deepspeed_stage_2"
 diffusion_trainer:
-  target: pl_trainer.discrete_diffusion_trainer.DiscreteDiffusionEdgeTrainer
+  target: pl_trainer.mean_flow_trainer.MeanFlowTrainer
   params:
     accumulate_grad_batches: 1 #2
     loss_weights: 
@@ -31,35 +29,16 @@ diffusion_trainer:
     cond_drop_rate: 0.1
     guidance_scale: 4.0
 pipe:
-  target: pipelines.diffusion_pipeline.DiscreteDiffusionEdgePipeline
+  target: pipelines.mean_flow_pipeline.MeanFlowPipeline
   params: {}
 denoiser: 
-  target: models.UNet_with_embedder.UNetWithEmbedder
+  target: models.mean_flow_model.DualTimestepDiTTransformer2DModel
   params:
-    in_channels: 32
-    out_channels: ${num_out_channels}
-    down_block_types:
-      - DownBlock2D
-      - DownBlock2D
-      - DownBlock2D
-      - DownBlock2D
-      - DownBlock2D
-      - AttnDownBlock2D
-    up_block_types:
-      - AttnUpBlock2D
-      - UpBlock2D
-      - UpBlock2D
-      - UpBlock2D
-      - UpBlock2D
-      - UpBlock2D
-    block_out_channels:
-      - 64
-      - 128
-      - 256
-      - 512
-      - 512
-      - 1024
-    layers_per_block: 2
+    in_channels: 3
+    out_channels: 3
+    num_layers: 12
+    num_attention_heads: 8
+    attention_head_dim: 64
 data:
   batch_size: 8 #16
   val_batch_size: 8
