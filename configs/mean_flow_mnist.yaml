@@ -17,7 +17,7 @@ diffusion_trainer:
   params:
     accumulate_grad_batches: 1 #2
     loss_weights: 
-      focal_xentropy: 1.0
+      l2: 1.0
     optim_args: 
       lr: 5e-5
       weight_decay: 1e-5
@@ -26,16 +26,15 @@ diffusion_trainer:
     use_ema: True
     ema_decay: 0.99
     ema_start: 50000
-    cond_drop_rate: 0.1
-    guidance_scale: 4.0
+    guidance_scale: 2.0
 pipe:
   target: pipelines.mean_flow_pipeline.MeanFlowPipeline
   params: {}
 denoiser: 
   target: models.mean_flow_model.DualTimestepDiTTransformer2DModel
   params:
-    in_channels: 3
-    out_channels: 3
+    in_channels: 1
+    out_channels: 1
     num_layers: 12
     num_attention_heads: 8
     attention_head_dim: 64
@@ -44,37 +43,18 @@ data:
   val_batch_size: 8
   train_shuffle: true
   val_shuffle: true
-  collate_fn: 
-    target: diffusion_datasets.dataset_utils.image_edge_unet_collate_fn
   train:
-    target: diffusion_datasets.dataset_utils.JointDataset
-    params:
-      mode: "train"
-      sampling_rates:
-        - 1.
-      subdatasets:
-        - target: diffusion_datasets.edge_datasets.LAION_synthetic.LAIONSyntheticQuantizedLabeledDataset
-          params: 
-            root_dir: /home/devdata/laion/edge_detection
-            image_shape: 
-              - ${image_size}
-              - ${image_size}
-            mode: train
-            num_colors: ${num_colors}
+    target: dataloaders.mnist.MNISTDataset
+    params: 
+      root: ./
+      download: true
+      train: true
   val:
-    target: diffusion_datasets.dataset_utils.ConcatDataset
-    params:
-      mode: "val"
-      subdatasets:
-        - target: diffusion_datasets.edge_datasets.LAION_synthetic.LAIONSyntheticQuantizedLabeledDataset
-          params: 
-            root_dir: /home/devdata/laion/edge_detection
-            image_shape: 
-              - ${image_size}
-              - ${image_size}
-            num_colors: ${num_colors}
-            mode: test
-            max_samples: 100
+    target: dataloaders.mnist.MNISTDataset
+    params: 
+      root: ./
+      download: true
+      train: false
 callbacks:
   - target: pytorch_lightning.callbacks.ModelCheckpoint
     params:

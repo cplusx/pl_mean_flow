@@ -36,7 +36,7 @@ class MeanFlowPipeline(DiffusionPipeline):
 
         batch_size = num_samples
         e = randn_tensor(
-            shape=(batch_size, 3, height, width),
+            shape=(batch_size, 1, height, width),
             generator=generator,
             device=self._execution_device,
             dtype=self.denoiser.dtype,
@@ -57,8 +57,7 @@ class MeanFlowPipeline(DiffusionPipeline):
             t=torch.tensor([1] * batch_size, device=self._execution_device, dtype=torch.long),
             r=torch.tensor([0] * batch_size, device=self._execution_device, dtype=torch.long),
             class_labels=class_labels,
-            return_dict=True
-        ).sample
+        )
 
         samples = e - noise_pred # range -1, 1
         samples = (samples + 1.0) / 2.0  # normalize to [0, 1]

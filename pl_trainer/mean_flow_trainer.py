@@ -3,6 +3,10 @@ from torch import nn
 import torch.nn.functional as F
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import pytorch_lightning as pl
+from einops import rearrange
+from functools import partial
+from diffusers.models.attention import Attention
+from diffusers.models.attention_processor import AttnProcessor
 
 class MeanFlowTrainer(pl.LightningModule):
     def __init__(
@@ -45,6 +49,10 @@ class MeanFlowTrainer(pl.LightningModule):
             if self.denoiser._supports_gradient_checkpointing:
                 self.denoiser.enable_gradient_checkpointing()
 
+        for name, m in self.denoiser.named_modules():
+            if isinstance(m, Attention):
+                m.set_processor(AttnProcessor()) # compatible with jvp
+
     def init_ema_model(self):
         if self.ema_decay:
             self.ema_denoiser = AveragedModel(self.denoiser, multi_avg_fn=get_ema_multi_avg_fn(self.ema_decay))
@@ -59,8 +67,8 @@ class MeanFlowTrainer(pl.LightningModule):
 
     def sample_t_and_r(self, batch_size):
         lognormal_sampler = torch.distributions.log_normal.LogNormal(loc=torch.tensor([-2.0]), scale=torch.tensor([2.0]))
-        t = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device)
-        r = lognormal_sampler.sample((batch_size,)).clamp(min=0.0, max=1.0).to(self.denoiser.device)
+        t = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device).squeeze()
+        r = lognormal_sampler.sample((batch_size,)).clamp(min=0.0, max=1.0).to(self.denoiser.device).squeeze()
         r = torch.where(
             torch.rand(batch_size, device=self.denoiser.device) < self.t_r_equal_rate,  # with probability t_r_equal_rate
             t,  # if r is less than t_r_equal_rate, set r = t
@@ -70,18 +78,29 @@ class MeanFlowTrainer(pl.LightningModule):
 
     def train_internal_step(self, batch, batch_idx, mode='train'):
         image = batch['image']
+        class_labels = batch['label']
         image = image.to(self.denoiser.dtype)
         x = (image * 2.0 - 1.0)  # normalize to [-1, 1]
 
         t, r = self.sample_t_and_r(image.shape[0])
+        t_ = rearrange(t, 'b -> b 1 1 1')
+        r_ = rearrange(r, 'b -> b 1 1 1')
 
         noise = torch.randn_like(x, device=self.denoiser.device)
-        z = (1 - t) * x + t * noise
+        z = (1 - t_) * x + t_ * noise
         v = noise - x
 
-        u, du_dt = torch.func.jvp(self.denoiser, (z, r, t), (v, 0, 1))
+        call_denoiser = partial(self.denoiser, class_labels=class_labels)
 
-        target = (v - (t - r) * du_dt).detach()
+        all_zero = torch.tensor([0.0] * len(x), device=self.denoiser.device)
+        all_one = torch.tensor([1.0] * len(x), device=self.denoiser.device)
+        u, du_dt = torch.autograd.functional.jvp(
+            call_denoiser, 
+            (z, r, t), 
+            (v, all_zero, all_one),
+        )
+
+        target = (v - (t_ - r_) * du_dt).detach()
 
         loss = 0
         res_dict = {
@@ -131,7 +150,7 @@ class MeanFlowTrainer(pl.LightningModule):
 
     @torch.inference_mode()
     def validation_step(self, batch, batch_idx):
-        image = batch['image']
+        image = batch['image'] # B, H, W for mnist
         height, width = image.shape[2], image.shape[3]
         generated = self.pipe(
             height=height,

@@ -4,28 +4,6 @@ import os
 from pytorch_lightning.loggers import WandbLogger
 from misc_utils.model_utils import instantiate_from_config, get_obj_from_str
 
-def get_vae_model(args):
-    if hasattr(args.trainer_args, 'precision'):
-        torch_dtype = torch.float16 if args.trainer_args.precision == 16 else torch.float32
-    else:
-        torch_dtype = torch.float32
-    if hasattr(args.vae.params, 'pretrained_model_name_or_path'):
-        vae = get_obj_from_str(args.vae.target).from_pretrained(**args.vae.params, torch_dtype=torch_dtype)
-    elif hasattr(args.vae.params, 'config'):
-        vae = get_obj_from_str(args.vae.target).from_config(**args.vae.params)
-    else:
-        vae = get_obj_from_str(args.vae.target)(**args.vae.params)
-    return vae
-
-def get_vae_trainer(vae, vae_trainer_args):
-    vae_trainer_class = vae_trainer_args['target']
-    vae_trainer_args = vae_trainer_args['params']
-    vae_trainer = get_obj_from_str(vae_trainer_class)(
-        vae,
-        **vae_trainer_args
-    )
-    return vae_trainer
-
 def get_models(args):
     if hasattr(args.trainer_args, 'precision'):
         torch_dtype = torch.float16 if args.trainer_args.precision == 16 else torch.float32
@@ -134,24 +112,4 @@ def unit_test_diffusion_val_step(config_path):
     ddpm = unit_test_create_diffusion_model(config_path)
     batch = unit_test_create_dataset(config_path, split='val')
     res = ddpm.validation_step(batch, 0)
-    return res
-
-def unit_test_create_vae(config_path):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    conf = OmegaConf.load(config_path)
-    vae = get_vae_model(conf)
-    vae_trainer = get_vae_trainer(vae, conf['vae_trainer'])
-    vae_trainer = vae_trainer.to(device)
-    return vae_trainer
-
-def unit_test_vae_training_step(config_path):
-    vae = unit_test_create_vae(config_path)
-    batch = unit_test_create_dataset(config_path)
-    res = vae.training_step(batch, 0)
-    return res
-
-def unit_test_vae_val_step(config_path):
-    vae = unit_test_create_vae(config_path)
-    batch = unit_test_create_dataset(config_path, split='val')
-    res = vae.validation_step(batch, 0)
     return res

@@ -102,7 +102,6 @@ class DualTimestepDiTTransformer2DModel(ModelMixin, ConfigMixin):
         r: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
-        return_dict: bool = True,
     ):
         """
         The [`DiTTransformer2DModel`] forward method.
@@ -174,8 +173,4 @@ class DualTimestepDiTTransformer2DModel(ModelMixin, ConfigMixin):
         output = hidden_states.reshape(
             shape=(-1, self.out_channels, height * self.patch_size, width * self.patch_size)
         )
-
-        if not return_dict:
-            return (output,)
-
-        return Transformer2DModelOutput(sample=output)
+        return output
