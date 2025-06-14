@@ -69,6 +69,10 @@ class MeanFlowTrainer(pl.LightningModule):
         lognormal_sampler = torch.distributions.log_normal.LogNormal(loc=torch.tensor([-2.0]), scale=torch.tensor([2.0]))
         t = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device).squeeze()
         r = lognormal_sampler.sample((batch_size,)).clamp(min=0.0, max=1.0).to(self.denoiser.device).squeeze()
+        # ensure t >= r
+        t_ = torch.where(t < r, r, t)
+        r_ = torch.where(t < r, t, r)
+        t, r = t_, r_
         r = torch.where(
             torch.rand(batch_size, device=self.denoiser.device) < self.t_r_equal_rate,  # with probability t_r_equal_rate
             t,  # if r is less than t_r_equal_rate, set r = t
@@ -96,15 +100,16 @@ class MeanFlowTrainer(pl.LightningModule):
         all_one = torch.tensor([1.0] * len(x), device=self.denoiser.device)
         u, du_dt = torch.autograd.functional.jvp(
             call_denoiser, 
-            (z, r, t), 
-            (v, all_zero, all_one),
+            (z, t, r), 
+            (v, all_one, all_zero),
+            create_graph=True,
         )
 
         target = (v - (t_ - r_) * du_dt).detach()
 
         loss = 0
         res_dict = {
-            'image': image,
+            'image': batch['image'],
         }
         if 'l2' in self.loss_weights:
             l2_loss = self.loss_weights['l2'] * F.mse_loss(u, target, reduction='mean')

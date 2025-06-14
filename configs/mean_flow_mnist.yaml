@@ -1,6 +1,4 @@
 expt_dir: experiments
-num_colors: 6
-num_out_channels: 7
 expt_name: mean_flow_mnist
 trainer_args:
   max_epochs: 100
@@ -15,7 +13,7 @@ trainer_args:
 diffusion_trainer:
   target: pl_trainer.mean_flow_trainer.MeanFlowTrainer
   params:
-    accumulate_grad_batches: 1 #2
+    accumulate_grad_batches: 8
     loss_weights: 
       l2: 1.0
     optim_args: 
@@ -25,7 +23,7 @@ diffusion_trainer:
     gradient_checkpointing: True
     use_ema: True
     ema_decay: 0.99
-    ema_start: 50000
+    ema_start: 500
     guidance_scale: 2.0
 pipe:
   target: pipelines.mean_flow_pipeline.MeanFlowPipeline
@@ -39,10 +37,10 @@ denoiser:
     num_attention_heads: 8
     attention_head_dim: 64
 data:
-  batch_size: 8 #16
+  batch_size: 32
   val_batch_size: 8
   train_shuffle: true
-  val_shuffle: true
+  val_shuffle: false
   train:
     target: dataloaders.mnist.MNISTDataset
     params: 
