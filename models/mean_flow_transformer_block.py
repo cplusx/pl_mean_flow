@@ -1,14 +1,128 @@
 import torch
-from typing import Any, Dict, Optional, Union, List
+from typing import Any, Dict, Optional, Union, List, Tuple
 from torch import nn
-from diffusers.models.attention import Attention, GatedSelfAttentionDense
-from diffusers.models.feed_forward import FeedForward
-from diffusers.models.attention import BasicTransformerBlock
+from diffusers.models.attention import (
+    Attention, 
+    GatedSelfAttentionDense, 
+    FeedForward,
+    SinusoidalPositionalEmbedding,
+    AdaLayerNorm,
+    AdaLayerNormZero,
+    AdaLayerNormContinuous,
+    logging,
+    _chunked_feed_forward
+)
+from diffusers.models.normalization import FP32LayerNorm, CombinedTimestepLabelEmbeddings
 
-class DualTimestepLayerNorm(nn.Module):
-    pass
+logger = logging.get_logger(__name__)
 
-class BasicTransformerBlock(nn.Module):
+class DualTimestepAdaLayerNorm(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_embeddings: Optional[int] = None,
+        output_dim: Optional[int] = None,
+        norm_elementwise_affine: bool = False,
+        norm_eps: float = 1e-5,
+        chunk_dim: int = 0,
+    ):
+        super().__init__()
+
+        self.chunk_dim = chunk_dim
+        output_dim = output_dim or embedding_dim * 2
+
+        if num_embeddings is not None:
+            self.emb = nn.Embedding(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        # self.linear = nn.Linear(embedding_dim, output_dim)
+        self.linear = nn.Sequential(
+            nn.Linear(embedding_dim * 2, output_dim),
+            nn.SiLU(),
+            nn.Linear(output_dim, output_dim)
+        )
+        self.norm = nn.LayerNorm(output_dim // 2, norm_eps, norm_elementwise_affine)
+
+    def forward(
+        self, x: torch.Tensor, 
+        t: Optional[torch.Tensor] = None, 
+        r: Optional[torch.Tensor] = None, 
+        # temb: Optional[torch.Tensor] = None,
+        # remb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.emb is not None:
+            temb = self.emb(t)
+            remb = self.emb(r)
+
+        temb = self.linear(self.silu(
+            torch.cat([temb, remb], dim=-1)
+        ))
+
+        if self.chunk_dim == 1:
+            # This is a bit weird why we have the order of "shift, scale" here and "scale, shift" in the
+            # other if-branch. This branch is specific to CogVideoX for now.
+            shift, scale = temb.chunk(2, dim=1)
+            shift = shift[:, None, :]
+            scale = scale[:, None, :]
+        else:
+            scale, shift = temb.chunk(2, dim=0)
+
+        x = self.norm(x) * (1 + scale) + shift
+        return x
+
+class DualTimestepAdaLayerNormZero(nn.Module):
+    r"""
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self, embedding_dim: int, num_embeddings: Optional[int] = None, norm_type="layer_norm", bias=True):
+        super().__init__()
+        if num_embeddings is not None:
+            self.emb = CombinedTimestepLabelEmbeddings(num_embeddings, embedding_dim)
+        else:
+            self.emb = None
+
+        self.silu = nn.SiLU()
+        # self.linear = nn.Linear(embedding_dim, 6 * embedding_dim, bias=bias)
+        self.linear = nn.Sequential(
+            nn.Linear(embedding_dim * 2, 6 * embedding_dim, bias=bias),
+            nn.SiLU(),
+            nn.Linear(6 * embedding_dim, 6 * embedding_dim, bias=bias)
+        )
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, elementwise_affine=False, eps=1e-6)
+        elif norm_type == "fp32_layer_norm":
+            self.norm = FP32LayerNorm(embedding_dim, elementwise_affine=False, bias=False)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: Optional[torch.Tensor] = None,
+        r: Optional[torch.Tensor] = None,
+        class_labels: Optional[torch.LongTensor] = None,
+        hidden_dtype: Optional[torch.dtype] = None,
+        emb: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.emb is not None:
+            temb = self.emb(t, class_labels, hidden_dtype=hidden_dtype)
+            remb = self.emb(r, class_labels, hidden_dtype=hidden_dtype)
+            emb = torch.cat([temb, remb], dim=-1)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+class DualTimestepBasicTransformerBlock(nn.Module):
     r"""
     A basic Transformer block.
 
@@ -112,10 +226,12 @@ class BasicTransformerBlock(nn.Module):
         # Define 3 blocks. Each block has its own normalization layer.
         # 1. Self-Attn
         if norm_type == "ada_norm":
-            self.norm1 = AdaLayerNorm(dim, num_embeds_ada_norm)
+            self.norm1 = DualTimestepAdaLayerNorm(dim, num_embeds_ada_norm)
         elif norm_type == "ada_norm_zero":
-            self.norm1 = AdaLayerNormZero(dim, num_embeds_ada_norm)
+            self.norm1 = DualTimestepAdaLayerNormZero(dim, num_embeds_ada_norm)
         elif norm_type == "ada_norm_continuous":
+            raise RuntimeError(
+                "AdaLayerNormContinuous is not supported in DualTimestepBasicTransformerBlock. ")
             self.norm1 = AdaLayerNormContinuous(
                 dim,
                 ada_norm_continous_conditioning_embedding_dim,
@@ -144,8 +260,11 @@ class BasicTransformerBlock(nn.Module):
             # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
             # the second cross attention block.
             if norm_type == "ada_norm":
-                self.norm2 = AdaLayerNorm(dim, num_embeds_ada_norm)
+                self.norm2 = DualTimestepAdaLayerNorm(dim, num_embeds_ada_norm)
             elif norm_type == "ada_norm_continuous":
+                raise RuntimeError(
+                    "AdaLayerNormContinuous is not supported in DualTimestepBasicTransformerBlock. "
+                )
                 self.norm2 = AdaLayerNormContinuous(
                     dim,
                     ada_norm_continous_conditioning_embedding_dim,
@@ -222,7 +341,8 @@ class BasicTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
+        t: Optional[torch.LongTensor] = None,
+        r: Optional[torch.LongTensor] = None,
         cross_attention_kwargs: Dict[str, Any] = None,
         class_labels: Optional[torch.LongTensor] = None,
         added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
@@ -236,23 +356,26 @@ class BasicTransformerBlock(nn.Module):
         batch_size = hidden_states.shape[0]
 
         if self.norm_type == "ada_norm":
-            norm_hidden_states = self.norm1(hidden_states, timestep)
+            norm_hidden_states = self.norm1(hidden_states, t, r)
         elif self.norm_type == "ada_norm_zero":
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(
-                hidden_states, timestep, class_labels, hidden_dtype=hidden_states.dtype
+                hidden_states, t, r, class_labels, hidden_dtype=hidden_states.dtype
             )
-        elif self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
-            norm_hidden_states = self.norm1(hidden_states)
-        elif self.norm_type == "ada_norm_continuous":
-            norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
-        elif self.norm_type == "ada_norm_single":
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-                self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
-            ).chunk(6, dim=1)
-            norm_hidden_states = self.norm1(hidden_states)
-            norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
         else:
-            raise ValueError("Incorrect norm used")
+            raise RuntimeError(
+                f"Norm type {self.norm_type} is not supported in DualTimestepBasicTransformerBlock. ")
+            if self.norm_type in ["layer_norm", "layer_norm_i2vgen"]:
+                norm_hidden_states = self.norm1(hidden_states)
+            elif self.norm_type == "ada_norm_continuous":
+                norm_hidden_states = self.norm1(hidden_states, added_cond_kwargs["pooled_text_emb"])
+            elif self.norm_type == "ada_norm_single":
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    self.scale_shift_table[None] + t.reshape(batch_size, 6, -1) # should I disable these branches?
+                ).chunk(6, dim=1)
+                norm_hidden_states = self.norm1(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+            else:
+                raise ValueError("Incorrect norm used")
 
         if self.pos_embed is not None:
             norm_hidden_states = self.pos_embed(norm_hidden_states)
@@ -284,7 +407,7 @@ class BasicTransformerBlock(nn.Module):
         # 3. Cross-Attention
         if self.attn2 is not None:
             if self.norm_type == "ada_norm":
-                norm_hidden_states = self.norm2(hidden_states, timestep)
+                norm_hidden_states = self.norm2(hidden_states, t, r)
             elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
                 norm_hidden_states = self.norm2(hidden_states)
             elif self.norm_type == "ada_norm_single":

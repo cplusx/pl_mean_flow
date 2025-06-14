@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 import pytorch_lightning as pl
 
 class MeanFlowTrainer(pl.LightningModule):
@@ -59,7 +60,7 @@ class MeanFlowTrainer(pl.LightningModule):
     def sample_t_and_r(self, batch_size):
         lognormal_sampler = torch.distributions.log_normal.LogNormal(loc=torch.tensor([-2.0]), scale=torch.tensor([2.0]))
         t = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device)
-        r = lognormal_sampler.sample((batch_size,)).clamp(min=0.01, max=1.0).to(self.denoiser.device)
+        r = lognormal_sampler.sample((batch_size,)).clamp(min=0.0, max=1.0).to(self.denoiser.device)
         r = torch.where(
             torch.rand(batch_size, device=self.denoiser.device) < self.t_r_equal_rate,  # with probability t_r_equal_rate
             t,  # if r is less than t_r_equal_rate, set r = t
@@ -70,6 +71,7 @@ class MeanFlowTrainer(pl.LightningModule):
     def train_internal_step(self, batch, batch_idx, mode='train'):
         image = batch['image']
         image = image.to(self.denoiser.dtype)
+        x = (image * 2.0 - 1.0)  # normalize to [-1, 1]
 
         t, r = self.sample_t_and_r(image.shape[0])
 
@@ -129,8 +131,13 @@ class MeanFlowTrainer(pl.LightningModule):
 
     @torch.inference_mode()
     def validation_step(self, batch, batch_idx):
+        image = batch['image']
+        height, width = image.shape[2], image.shape[3]
         generated = self.pipe(
-            # TODO, specify kwargs
+            height=height,
+            width=width,
+            num_samples=image.shape[0],
+            # class_labels=batch.get('class_labels', None),
             output_type='numpy',
             return_dict=False
         )[0]

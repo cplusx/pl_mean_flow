@@ -1,7 +1,17 @@
-from diffusers.models.transformers.dit_transformer_2d import DiTTransformer2DModel
-from .mean_flow_transformer_block import BasicTransformerBlock
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.models.transformers.dit_transformer_2d import (
+    register_to_config,
+    ModelMixin,
+    ConfigMixin,
+    PatchEmbed,
+    Transformer2DModelOutput,
+)
+from typing import Any, Dict, Optional
+from .mean_flow_transformer_block import DualTimestepBasicTransformerBlock
 
-class DiTTransformer2DModel(ModelMixin, ConfigMixin):
+class DualTimestepDiTTransformer2DModel(ModelMixin, ConfigMixin):
 
     _skip_layerwise_casting_patterns = ["pos_embed", "norm"]
     _supports_gradient_checkpointing = True
@@ -60,7 +70,7 @@ class DiTTransformer2DModel(ModelMixin, ConfigMixin):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                BasicTransformerBlock(
+                DualTimestepBasicTransformerBlock(
                     self.inner_dim,
                     self.config.num_attention_heads,
                     self.config.attention_head_dim,
@@ -79,7 +89,8 @@ class DiTTransformer2DModel(ModelMixin, ConfigMixin):
 
         # 3. Output blocks.
         self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=1e-6)
-        self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
+        # self.proj_out_1 = nn.Linear(self.inner_dim, 2 * self.inner_dim)
+        self.proj_out_1 = nn.Linear(2 * self.inner_dim, 2 * self.inner_dim)
         self.proj_out_2 = nn.Linear(
             self.inner_dim, self.config.patch_size * self.config.patch_size * self.out_channels
         )
@@ -87,7 +98,6 @@ class DiTTransformer2DModel(ModelMixin, ConfigMixin):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        # timestep: Optional[torch.LongTensor] = None,
         t: Optional[torch.Tensor] = None,
         r: Optional[torch.Tensor] = None,
         class_labels: Optional[torch.LongTensor] = None,
@@ -130,7 +140,7 @@ class DiTTransformer2DModel(ModelMixin, ConfigMixin):
                     None,
                     None,
                     None,
-                    timestep,
+                    t, r,
                     cross_attention_kwargs,
                     class_labels,
                 )
@@ -140,13 +150,17 @@ class DiTTransformer2DModel(ModelMixin, ConfigMixin):
                     attention_mask=None,
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
-                    timestep=timestep,
+                    t=t,
+                    r=r,
                     cross_attention_kwargs=cross_attention_kwargs,
                     class_labels=class_labels,
                 )
 
         # 3. Output
-        conditioning = self.transformer_blocks[0].norm1.emb(timestep, class_labels, hidden_dtype=hidden_states.dtype)
+        # conditioning = self.transformer_blocks[0].norm1.emb(t=t, r=r, class_labels=class_labels, hidden_dtype=hidden_states.dtype)
+        t_conditioning = self.transformer_blocks[0].norm1.emb(t, class_labels=class_labels, hidden_dtype=hidden_states.dtype)
+        r_conditioning = self.transformer_blocks[0].norm1.emb(r, class_labels=class_labels, hidden_dtype=hidden_states.dtype)
+        conditioning = torch.cat([t_conditioning, r_conditioning], dim=-1)
         shift, scale = self.proj_out_1(F.silu(conditioning)).chunk(2, dim=1)
         hidden_states = self.norm_out(hidden_states) * (1 + scale[:, None]) + shift[:, None]
         hidden_states = self.proj_out_2(hidden_states)
